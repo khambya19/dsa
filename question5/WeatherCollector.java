@@ -20,7 +20,7 @@ import javax.swing.table.DefaultTableModel;
 
 /**
  * Q5(b): Multi-threaded Weather Data Collector
- * API: OpenWeatherMap (single free API)
+ * API: https://api.open-meteo.com/v1/forecast?latitude=52.52&longitude=13.41&hourly=temperature_2m
  */
 public class WeatherCollector extends JFrame {
 
@@ -91,7 +91,7 @@ public class WeatherCollector extends JFrame {
         JLabel title = new JLabel("Nepal Weather Dashboard (Sequential vs Parallel)");
         title.setForeground(TEXT_DARK);
         title.setFont(new Font("SansSerif", Font.BOLD, 20));
-        JLabel subtitle = new JLabel("OpenWeatherMap API - 5 Nepal cities - thread-safe Swing updates");
+        JLabel subtitle = new JLabel("Open-Meteo API - 5 Nepal cities - thread-safe Swing updates");
         subtitle.setForeground(TEXT_DARK);
         subtitle.setFont(new Font("SansSerif", Font.PLAIN, 12));
         header.add(title, BorderLayout.NORTH);
@@ -115,7 +115,7 @@ public class WeatherCollector extends JFrame {
         gbc.gridx = 0;
         gbc.gridy = 0;
 
-        JLabel keyLabel = new JLabel("OpenWeatherMap API Key:");
+        JLabel keyLabel = new JLabel("API Key (optional):");
         keyLabel.setFont(new Font("SansSerif", Font.BOLD, 13));
         keyLabel.setForeground(TEXT_DARK);
         controls.add(keyLabel, gbc);
@@ -123,6 +123,7 @@ public class WeatherCollector extends JFrame {
         gbc.gridx = 1;
         gbc.weightx = 1.0;
         apiKeyField = new JTextField(32);
+        apiKeyField.setText("Not required for Open-Meteo");
         apiKeyField.setFont(new Font("SansSerif", Font.PLAIN, 13));
         apiKeyField.setForeground(TEXT_DARK);
         apiKeyField.setBackground(new Color(252, 254, 255));
@@ -232,15 +233,6 @@ public class WeatherCollector extends JFrame {
 
     // Validates input and runs sequential + parallel fetch workflow.
     private void startFetchWorkflow() {
-        String apiKey = apiKeyField.getText().trim();
-        if (apiKey.isEmpty()) {
-            JOptionPane.showMessageDialog(this,
-                "Please enter your OpenWeatherMap API key.",
-                "Missing API Key",
-                JOptionPane.WARNING_MESSAGE);
-            return;
-        }
-
         fetchButton.setEnabled(false);
         statusLabel.setText("Fetching sequentially...");
         sequentialTimeLabel.setText("Sequential: running...");
@@ -254,12 +246,12 @@ public class WeatherCollector extends JFrame {
 
             @Override
             protected Void doInBackground() {
-                sequentialMs = runSequential(apiKey);
+                sequentialMs = runSequential();
                 SwingUtilities.invokeLater(() -> {
                     sequentialTimeLabel.setText("Sequential: " + sequentialMs + " ms");
                     statusLabel.setText("Fetching in parallel with 5 threads...");
                 });
-                parallelMs = runParallel(apiKey);
+                parallelMs = runParallel();
                 return null;
             }
 
@@ -277,26 +269,24 @@ public class WeatherCollector extends JFrame {
     }
 
     // Measures one-by-one fetching latency for all cities.
-    private long runSequential(String apiKey) {
+    private long runSequential() {
         long start = System.nanoTime();
         for (String city : CITIES) {
-            fetchWeatherForCity(city, apiKey);
+            fetchWeatherForCity(city);
         }
         return (System.nanoTime() - start) / 1_000_000;
     }
 
     // Fetches all cities concurrently using one thread per city.
-    private long runParallel(String apiKey) {
+    private long runParallel() {
         long start = System.nanoTime();
         ExecutorService pool = Executors.newFixedThreadPool(CITIES.length);
         CountDownLatch latch = new CountDownLatch(CITIES.length);
-        ConcurrentHashMap<String, WeatherResult> parallelResults = new ConcurrentHashMap<>();
 
         for (String city : CITIES) {
             pool.submit(() -> {
                 try {
-                    WeatherResult result = fetchWeatherForCity(city, apiKey);
-                    parallelResults.put(city, result);
+                    WeatherResult result = fetchWeatherForCity(city);
                     SwingUtilities.invokeLater(() -> updateRow(result));
                 } finally {
                     latch.countDown();
@@ -315,15 +305,35 @@ public class WeatherCollector extends JFrame {
         return (System.nanoTime() - start) / 1_000_000;
     }
 
-    // Calls OpenWeatherMap for one city and parses core weather values.
-    private WeatherResult fetchWeatherForCity(String city, String apiKey) {
+    // Calls Open-Meteo geocoding + forecast for one city and parses weather values.
+    private WeatherResult fetchWeatherForCity(String city) {
         try {
-            String encodedCity = URLEncoder.encode(city, StandardCharsets.UTF_8);
-            String encodedKey = URLEncoder.encode(apiKey, StandardCharsets.UTF_8);
-            String url = "https://api.openweathermap.org/data/2.5/weather?q="
-                + encodedCity + "&units=metric&appid=" + encodedKey;
+            String encodedCity = URLEncoder.encode(city + ", Nepal", StandardCharsets.UTF_8);
+            String geoUrl = "https://geocoding-api.open-meteo.com/v1/search?name="
+                + encodedCity + "&count=1&language=en&format=json";
 
-            HttpRequest request = HttpRequest.newBuilder(URI.create(url))
+            HttpRequest geoRequest = HttpRequest.newBuilder(URI.create(geoUrl))
+                .timeout(Duration.ofSeconds(15))
+                .GET()
+                .build();
+
+            HttpResponse<String> geoResponse = client.send(geoRequest, HttpResponse.BodyHandlers.ofString());
+            if (geoResponse.statusCode() != 200) {
+                return new WeatherResult(city, null, null, null, "-", "Geo HTTP " + geoResponse.statusCode());
+            }
+
+            String geoJson = geoResponse.body();
+            Double lat = extractDouble(geoJson, "\\\"latitude\\\"\\s*:\\s*(-?\\d+(?:\\.\\d+)?)");
+            Double lon = extractDouble(geoJson, "\\\"longitude\\\"\\s*:\\s*(-?\\d+(?:\\.\\d+)?)");
+            if (lat == null || lon == null) {
+                return new WeatherResult(city, null, null, null, "-", "City not found");
+            }
+
+            String weatherUrl = "https://api.open-meteo.com/v1/forecast?latitude="
+                + lat + "&longitude=" + lon
+                + "&current=temperature_2m,relative_humidity_2m,surface_pressure,weather_code&timezone=auto";
+
+            HttpRequest request = HttpRequest.newBuilder(URI.create(weatherUrl))
                 .timeout(Duration.ofSeconds(15))
                 .GET()
                 .build();
@@ -334,21 +344,22 @@ public class WeatherCollector extends JFrame {
             }
 
             String json = response.body();
-            Double temp = extractDouble(json, "\\\"temp\\\"\\s*:\\s*(-?\\d+(?:\\.\\d+)?)");
-            Double humidityRaw = extractDouble(json, "\\\"humidity\\\"\\s*:\\s*(\\d+(?:\\.\\d+)?)");
-            Double pressureRaw = extractDouble(json, "\\\"pressure\\\"\\s*:\\s*(\\d+(?:\\.\\d+)?)");
-            String condition = extractString(json, "\\\"description\\\"\\s*:\\s*\\\"([^\\\"]+)\\\"");
+            Double temp = extractDouble(json, "\\\"temperature_2m\\\"\\s*:\\s*(-?\\d+(?:\\.\\d+)?)");
+            Double humidityRaw = extractDouble(json, "\\\"relative_humidity_2m\\\"\\s*:\\s*(\\d+(?:\\.\\d+)?)");
+            Double pressureRaw = extractDouble(json, "\\\"surface_pressure\\\"\\s*:\\s*(\\d+(?:\\.\\d+)?)");
+            Double weatherCodeRaw = extractDouble(json, "\\\"weather_code\\\"\\s*:\\s*(\\d+)");
 
-            if (temp == null || humidityRaw == null || pressureRaw == null) {
+            if (temp == null || humidityRaw == null || pressureRaw == null || weatherCodeRaw == null) {
                 return new WeatherResult(city, null, null, null, "-", "Parse error");
             }
 
+            int weatherCode = (int) Math.round(weatherCodeRaw);
             return new WeatherResult(
                 city,
                 temp,
                 (int) Math.round(humidityRaw),
                 (int) Math.round(pressureRaw),
-                condition == null ? "-" : condition,
+                weatherCodeToText(weatherCode),
                 "OK"
             );
         } catch (Exception e) {
@@ -367,6 +378,22 @@ public class WeatherCollector extends JFrame {
     private String extractString(String input, String pattern) {
         Matcher matcher = Pattern.compile(pattern).matcher(input);
         return matcher.find() ? matcher.group(1) : null;
+    }
+
+    // Converts Open-Meteo weather code to a readable condition.
+    private String weatherCodeToText(int code) {
+        return switch (code) {
+            case 0 -> "Clear sky";
+            case 1, 2, 3 -> "Partly cloudy";
+            case 45, 48 -> "Fog";
+            case 51, 53, 55, 56, 57 -> "Drizzle";
+            case 61, 63, 65, 66, 67 -> "Rain";
+            case 71, 73, 75, 77 -> "Snow";
+            case 80, 81, 82 -> "Rain showers";
+            case 85, 86 -> "Snow showers";
+            case 95, 96, 99 -> "Thunderstorm";
+            default -> "Code " + code;
+        };
     }
 
     // Updates exactly one table row safely on the Swing thread.
